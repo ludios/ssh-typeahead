@@ -456,14 +456,16 @@ fn relay_terminal(
 /// Returns the child, and the master side of its new terminal.
 fn spawn_on_terminal(argv: &[OsString], cooked: &Termios, size: &Winsize) -> io::Result<(Child, OwnedFd)> {
 	let pty = openpty(size, cooked)?;
-	// Otherwise ssh, and its ControlPersist master, would hold its own terminal open
+	// Otherwise ssh, and its ControlPersist master, would hold its terminal
+	// open: the master side forever, and a stray slave side past ssh's stdin
+	// and stdout, keeping us waiting
 	fcntl(&pty.master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+	fcntl(&pty.slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
 	let mut command = Command::new(&argv[0]);
 	with_default_signals(&mut command)
 		.args(&argv[1..])
 		.stdin(Stdio::from(pty.slave.try_clone()?))
-		.stdout(Stdio::from(pty.slave.try_clone()?))
-		.stderr(Stdio::from(pty.slave));
+		.stdout(Stdio::from(pty.slave));
 	// SAFETY: setsid and ioctl are async-signal-safe
 	unsafe {
 		command.pre_exec(|| {
@@ -555,13 +557,17 @@ fn relay(markers: &Markers, keys_file: &Path, argv: &[OsString]) -> io::Result<i
 	// zle -U would stop at a NUL
 	let keys: Vec<u8> = without_cancelled(&keys, &cooked).iter().copied().filter(|&k| k != 0).collect();
 	if !keys.is_empty() && is_safe_keys_file(keys_file, keyboard) {
-		OpenOptions::new()
+		let saved = OpenOptions::new()
 			.append(true)
 			.create(true)
 			.mode(0o600)
 			.custom_flags(libc::O_NOFOLLOW)
-			.open(keys_file)?
-			.write_all(&keys)?;
+			.open(keys_file)
+			.and_then(|mut file| file.write_all(&keys));
+		// The keys are a nicety: losing them doesn't change ssh's status
+		if let Err(e) = saved {
+			eprintln!("ssh-typeahead: {}: {e}", keys_file.display());
+		}
 	}
 	Ok(status)
 }
