@@ -11,7 +11,9 @@ Wrap the ssh, and the command on the far host:
 
 	ssh-typeahead relay NONCE "$SSH_TYPEAHEAD_FILE" ssh -t HOST ssh-typeahead run NONCE COMMAND...
 
-NONCE must be new for each command. Once the command has exited, `run` reads
+where COMMAND is quoted for the far host's shell, as with any ssh. NONCE must
+be new for each command, and 1 to 64 letters, digits, dots, dashes and
+underscores. Once the command has exited, `run` reads
 the keys left on the far terminal, and `relay` stops sending keys and tells
 `run` when all the ones it sent have arrived. `relay` appends them to
 `$SSH_TYPEAHEAD_FILE`, and `ssh-typeahead.zsh` gives them to zle at the next
@@ -28,7 +30,8 @@ typed before it.
 - Install `ssh-typeahead` on both hosts.
 - In zsh on the near host, `source ssh-typeahead.zsh`. It exports
   `SSH_TYPEAHEAD_FILE` only if `$XDG_RUNTIME_DIR` (or `$TMPDIR`) is a
-  directory you own, which `relay` checks too, along with the file being named
+  directory that you own and that the group and others can't write to, which
+  `relay` checks too, along with the file being named
   for its terminal and for its parent process. So run `relay` from that
   shell, or exec it from a script that the shell runs: when something else
   runs it, e.g. vim's `:!`, the keys belong to that program, not to the shell,
@@ -43,6 +46,10 @@ typed before it.
 - zle gets the keys, not a command started at the next prompt.
 - A process left running on the far terminal can read the keys, and END with
   them; `run` then gives up after 2 seconds.
+- At most 64 KiB of keys come back, and keys that send a NUL (e.g. ^@) don't,
+  since zle can't take them.
+- ssh's escape for suspending it (`~^Z`) leaves it stopped for good: nothing
+  in its session can continue it. End it with `~.` instead.
 
 ## Development
 
