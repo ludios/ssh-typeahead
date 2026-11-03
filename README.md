@@ -29,7 +29,10 @@ typed before it.
 - In zsh on the near host, `source ssh-typeahead.zsh`. It exports
   `SSH_TYPEAHEAD_FILE` only if `$XDG_RUNTIME_DIR` (or `$TMPDIR`) is a
   directory you own, which `relay` checks too, along with the file being named
-  for its terminal.
+  for its terminal and for its parent process. So run `relay` from that
+  shell, or exec it from a script that the shell runs: when something else
+  runs it, e.g. vim's `:!`, the keys belong to that program, not to the shell,
+  and are lost as before.
 - Use it only with a far host you trust as much as the near one: whatever
   `run` hands back gets typed into your shell.
 

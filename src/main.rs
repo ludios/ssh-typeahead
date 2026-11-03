@@ -19,7 +19,10 @@
 //!    sending are still queued on this terminal, and zle reads them after these.
 //!
 //! FILE is the $SSH_TYPEAHEAD_FILE that ssh-typeahead.zsh exports, which names
-//! this terminal and the shell on it.
+//! this terminal and the shell on it. `relay` writes it only if that shell is
+//! its parent, i.e. ran `relay`, or a script that execs it, at the prompt: the
+//! keys belong to whichever program reads this terminal next, and that's the
+//! shell only when the shell ran us.
 //!
 //! NONCE, chosen anew for each command, marks the messages, so that the
 //! command's output can't pass for them by accident. `run` can type into the
@@ -407,8 +410,10 @@ fn without_cancelled<'a>(keys: &'a [u8], cooked: &Termios) -> &'a [u8] {
 /// tty:  this terminal
 ///
 /// Returns whether to write keys to it: whether it's named for this terminal
-/// (not for one whose shell's $SSH_TYPEAHEAD_FILE we inherited, e.g. through
-/// tmux), and is in a directory that only we can write to.
+/// and for our parent, the shell that reads this terminal next (not for a
+/// shell further up, whose $SSH_TYPEAHEAD_FILE we inherited through e.g. vim's
+/// `:!`, or for one on another terminal, through e.g. tmux), and is in a
+/// directory that only we can write to.
 fn is_safe_keys_file(path: &Path, tty: BorrowedFd) -> bool {
 	let Ok(tty_path) = unistd::ttyname(tty) else {
 		return false;
@@ -420,7 +425,7 @@ fn is_safe_keys_file(path: &Path, tty: BorrowedFd) -> bool {
 	let Ok(dir) = std::fs::metadata(dir) else {
 		return false;
 	};
-	name.to_string_lossy().starts_with(&format!("ssh-typeahead-{tty_name}-"))
+	*name == *format!("ssh-typeahead-{tty_name}-{}", unistd::getppid())
 		&& dir.uid() == unistd::getuid().as_raw()
 		&& dir.mode() & 0o022 == 0
 }
@@ -449,6 +454,8 @@ fn relay(markers: &Markers, keys_file: &Path, argv: &[OsString]) -> io::Result<i
 	let keys = relay_terminal(keyboard, stdout.as_fd(), master.as_fd(), markers);
 	// TCSADRAIN keeps the keys typed after we stopped sending them
 	termios::tcsetattr(keyboard, SetArg::TCSADRAIN, &cooked)?;
+	// If relaying failed, ssh may be stuck writing to its terminal until it closes
+	drop(master);
 	let status = shell_status(ssh.wait()?);
 	let keys = keys?.unwrap_or_default();
 	// zle -U would stop at a NUL
