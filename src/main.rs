@@ -120,6 +120,18 @@ fn shell_status(status: ExitStatus) -> i32 {
 	status.code().unwrap_or_else(|| 128 + status.signal().expect("a process that didn't exit was killed by a signal"))
 }
 
+/// Makes `command` start its process with no signals blocked, as programs
+/// expect, whatever we block: Command passes on our signal mask.
+fn with_default_signals(command: &mut Command) -> &mut Command {
+	// SAFETY: sigprocmask is async-signal-safe
+	unsafe {
+		command.pre_exec(|| {
+			signal::sigprocmask(signal::SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)?;
+			Ok(())
+		})
+	}
+}
+
 /// Runs `argv` in a child process on this terminal and waits for it. ^C and ^\
 /// reach the child, not us: we must live on to hand back the keys.
 ///
@@ -128,9 +140,9 @@ fn run_command(argv: &[OsString]) -> io::Result<i32> {
 	let mut stoppers = SigSet::empty();
 	stoppers.add(Signal::SIGINT);
 	stoppers.add(Signal::SIGQUIT);
-	// Blocked until we ignore them; Command gives the child an empty mask
+	// Blocked until we ignore them, so that they can't kill us meanwhile
 	stoppers.thread_block()?;
-	let child = Command::new(&argv[0]).args(&argv[1..]).spawn();
+	let child = with_default_signals(Command::new(&argv[0]).args(&argv[1..])).spawn();
 	for sig in stoppers.iter() {
 		// SAFETY: SIG_IGN installs no handler
 		unsafe { signal::signal(sig, SigHandler::SigIgn) }?;
@@ -370,7 +382,7 @@ fn spawn_on_terminal(argv: &[OsString], cooked: &Termios, size: &Winsize) -> io:
 	// Otherwise ssh, and its ControlPersist master, would hold its own terminal open
 	fcntl(&pty.master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
 	let mut command = Command::new(&argv[0]);
-	command
+	with_default_signals(&mut command)
 		.args(&argv[1..])
 		.stdin(Stdio::from(pty.slave.try_clone()?))
 		.stdout(Stdio::from(pty.slave.try_clone()?))
