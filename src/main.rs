@@ -31,17 +31,17 @@
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
-use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::libc;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::{Winsize, openpty};
@@ -256,7 +256,7 @@ fn scan(mut pending: &[u8], markers: &Markers) -> (Vec<u8>, Vec<Message>, Vec<u8
 			let keys_at = i + markers.return_start.len();
 			let Some(len) = find(&pending[keys_at..], STRING_TERMINATOR) else {
 				// Its keys aren't all here yet, unless something's wrong
-				if pending.len() - keys_at > 2 * MAX_KEYS {
+				if pending.len() - keys_at >= 2 * MAX_KEYS + STRING_TERMINATOR.len() {
 					output.extend_from_slice(pending);
 					return (output, messages, Vec::new());
 				}
@@ -277,10 +277,50 @@ fn scan(mut pending: &[u8], markers: &Markers) -> (Vec<u8>, Vec<Message>, Vec<u8
 	(output, messages, pending[pending.len() - held..].to_vec())
 }
 
-static WINDOW_CHANGED: AtomicBool = AtomicBool::new(false);
+/// The write end of the pipe through which note_signal wakes relay_terminal
+static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
+/// The signals that note_signal has seen and that we haven't taken, a bit per number
+static SIGNALS: AtomicU64 = AtomicU64::new(0);
+/// The signals that end `relay`, once it has put this terminal back
+const ENDING_SIGNALS: [Signal; 4] = [Signal::SIGHUP, Signal::SIGINT, Signal::SIGQUIT, Signal::SIGTERM];
 
-extern "C" fn note_window_change(_: libc::c_int) {
-	WINDOW_CHANGED.store(true, Ordering::Relaxed);
+extern "C" fn note_signal(sig: libc::c_int) {
+	let errno = Errno::last_raw();
+	SIGNALS.fetch_or(1 << sig, Ordering::Relaxed);
+	// SAFETY: write is async-signal-safe. If the pipe is full, it's readable already.
+	unsafe { libc::write(SIGNAL_PIPE.load(Ordering::Relaxed), [0u8].as_ptr().cast(), 1) };
+	Errno::set_raw(errno);
+}
+
+/// Returns whether `sig` arrived since we last took it, and takes it.
+fn take_signal(sig: Signal) -> bool {
+	let bit = 1 << sig as i32;
+	SIGNALS.fetch_and(!bit, Ordering::Relaxed) & bit != 0
+}
+
+/// Returns the first of ENDING_SIGNALS that arrived, if any did.
+fn ending_signal() -> Option<Signal> {
+	ENDING_SIGNALS.into_iter().find(|&sig| SIGNALS.load(Ordering::Relaxed) & 1 << sig as i32 != 0)
+}
+
+/// Installs note_signal for `signals`. Returns the read end of a pipe that
+/// becomes readable when one arrives, unlike a flag, which a poll that's about
+/// to start would miss.
+fn notify_signals(signals: &[Signal]) -> io::Result<OwnedFd> {
+	let (read, write) = unistd::pipe()?;
+	for fd in [&read, &write] {
+		fcntl(fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+		fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+	}
+	// Kept open for as long as the handler can run: until we exit
+	SIGNAL_PIPE.store(write.into_raw_fd(), Ordering::Relaxed);
+	// SA_RESTART, so that e.g. putting this terminal back isn't interrupted
+	let note = SigAction::new(SigHandler::Handler(note_signal), SaFlags::SA_RESTART, SigSet::empty());
+	for &sig in signals {
+		// SAFETY: the handler only uses atomics, write, and errno
+		unsafe { signal::sigaction(sig, &note) }?;
+	}
+	Ok(read)
 }
 
 nix::ioctl_read_bad!(get_window_size, libc::TIOCGWINSZ, Winsize);
@@ -295,28 +335,51 @@ fn window_size(tty: BorrowedFd) -> io::Result<Winsize> {
 
 /// keyboard: this terminal, to read keys from
 /// screen:   this terminal, to write output to
-/// master:   the master side of ssh's terminal
+/// master:   the master side of ssh's terminal, nonblocking
+/// signals:  notify_signals's pipe
 /// markers:  this NONCE's messages
 ///
 /// Relays keys to ssh, and its output back, doing our part of the handshake,
-/// until ssh's terminal closes. Returns the keys that `run` handed back, or
-/// None if it didn't.
-fn relay_terminal(keyboard: BorrowedFd, screen: BorrowedFd, master: BorrowedFd, markers: &Markers) -> io::Result<Option<Vec<u8>>> {
+/// until ssh's terminal closes or one of ENDING_SIGNALS arrives. Returns the
+/// keys that `run` handed back, or None if it didn't.
+fn relay_terminal(
+	keyboard: BorrowedFd,
+	screen: BorrowedFd,
+	master: BorrowedFd,
+	signals: BorrowedFd,
+	markers: &Markers,
+) -> io::Result<Option<Vec<u8>>> {
+	// After STOP, keys stay queued on this terminal, for the shell
 	let mut stopped = false;
+	let mut keyboard_open = true;
 	let mut keys = None;
+	// Keys, then END, on their way to ssh, which may not take them all at once
+	let mut to_ssh = Vec::new();
+	// Output that could be the start of a message, held back since held_since
 	let mut pending = Vec::new();
+	let mut held_since = Instant::now();
 	let mut buf = vec![0; 65536];
 	loop {
-		if WINDOW_CHANGED.swap(false, Ordering::Relaxed) {
+		if take_signal(Signal::SIGWINCH) {
 			let size = window_size(keyboard)?;
 			// SAFETY: TIOCSWINSZ reads a winsize
 			unsafe { set_window_size(master.as_raw_fd(), &size) }?;
 		}
-		let mut fds = vec![PollFd::new(master, PollFlags::POLLIN)];
-		if !stopped {
+		if ending_signal().is_some() {
+			return Ok(None);
+		}
+		// What follows STOP, or the start of RETURN, is a message on its way
+		let may_be_output = !stopped && !pending.is_empty() && !pending.starts_with(&markers.return_start);
+		let timeout = if may_be_output {
+			PollTimeout::try_from(HOLD.saturating_sub(held_since.elapsed())).unwrap()
+		} else {
+			PollTimeout::NONE
+		};
+		let master_events = if to_ssh.is_empty() { PollFlags::POLLIN } else { PollFlags::POLLIN | PollFlags::POLLOUT };
+		let mut fds = vec![PollFd::new(master, master_events), PollFd::new(signals, PollFlags::POLLIN)];
+		if keyboard_open && !stopped && to_ssh.len() < MAX_KEYS {
 			fds.push(PollFd::new(keyboard, PollFlags::POLLIN));
 		}
-		let timeout = if pending.is_empty() { PollTimeout::NONE } else { PollTimeout::try_from(HOLD).unwrap() };
 		match poll(&mut fds, timeout) {
 			Ok(0) => {
 				// It wasn't the start of a message after all
@@ -328,45 +391,59 @@ fn relay_terminal(keyboard: BorrowedFd, screen: BorrowedFd, master: BorrowedFd, 
 			Err(Errno::EINTR) => continue,
 			Err(e) => return Err(e.into()),
 		}
-		let master_ready = fds[0].any().unwrap_or(false);
-		let keyboard_ready = fds.get(1).is_some_and(|fd| fd.any().unwrap_or(false));
-		if keyboard_ready {
-			let n = match unistd::read(keyboard, &mut buf) {
-				Ok(n) => n,
-				Err(Errno::EINTR) => continue,
-				Err(e) => return Err(e.into()),
-			};
-			write_all(master, &buf[..n])?;
-			// A keyboard at its end has nothing more to send
-			stopped |= n == 0;
+		let ready: Vec<PollFlags> = fds.iter().map(|fd| fd.revents().unwrap_or(PollFlags::empty())).collect();
+		if !ready[1].is_empty() {
+			// The signals are in SIGNALS; this only empties the pipe
+			while unistd::read(signals, &mut buf).is_ok_and(|n| n > 0) {}
 		}
-		if master_ready {
+		if ready.get(2).is_some_and(|events| !events.is_empty()) {
+			match unistd::read(keyboard, &mut buf) {
+				Ok(0) => keyboard_open = false,
+				Ok(n) => to_ssh.extend_from_slice(&buf[..n]),
+				Err(Errno::EINTR | Errno::EAGAIN) => {}
+				Err(e) => return Err(e.into()),
+			}
+		}
+		if ready[0].intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR) {
 			let n = match unistd::read(master, &mut buf) {
 				Ok(n) => n,
 				// Linux says EIO once every process has closed ssh's terminal
 				Err(Errno::EIO) => 0,
-				Err(Errno::EINTR) => continue,
+				Err(Errno::EINTR | Errno::EAGAIN) => continue,
 				Err(e) => return Err(e.into()),
 			};
 			if n == 0 {
 				write_all(screen, &pending)?;
 				return Ok(keys);
 			}
+			let was_holding = !pending.is_empty();
 			pending.extend_from_slice(&buf[..n]);
 			let (output, messages, rest) = scan(&pending, markers);
 			pending = rest;
+			if !was_holding {
+				held_since = Instant::now();
+			}
 			write_all(screen, &output)?;
 			for message in messages {
 				match message {
 					Message::Stop if !stopped => {
 						stopped = true;
-						write_all(master, &markers.end)?;
+						to_ssh.extend_from_slice(&markers.end);
 					}
 					Message::Return(hex) if stopped && keys.is_none() => {
 						keys = Some(from_hex(&hex).unwrap_or_default());
 					}
 					_ => {}
 				}
+			}
+		}
+		if ready[0].contains(PollFlags::POLLOUT) {
+			match unistd::write(master, &to_ssh) {
+				Ok(n) => drop(to_ssh.drain(..n)),
+				// ssh has gone, which the next read will say
+				Err(Errno::EIO) => to_ssh.clear(),
+				Err(Errno::EINTR | Errno::EAGAIN) => {}
+				Err(e) => return Err(e.into()),
 			}
 		}
 	}
@@ -454,21 +531,26 @@ fn relay(markers: &Markers, keys_file: &Path, argv: &[OsString]) -> io::Result<i
 		// Nothing to relay, and no keys to bring back
 		return Err(Command::new(&argv[0]).args(&argv[1..]).exec());
 	}
+	// Before reading the window size, so that a change after it isn't missed
+	let signals = notify_signals(&[[Signal::SIGWINCH].as_slice(), &ENDING_SIGNALS].concat())?;
 	let cooked = termios::tcgetattr(keyboard)?;
 	let (mut ssh, master) = spawn_on_terminal(argv, &cooked, &window_size(keyboard)?)?;
-	let on_window_change = SigAction::new(SigHandler::Handler(note_window_change), SaFlags::empty(), SigSet::empty());
-	// SAFETY: the handler only stores to an atomic
-	unsafe { signal::sigaction(Signal::SIGWINCH, &on_window_change) }?;
+	fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
 	let mut raw = cooked.clone();
 	termios::cfmakeraw(&mut raw);
 	// Not TCSAFLUSH, which would drop the keys typed ahead before we started
 	termios::tcsetattr(keyboard, SetArg::TCSANOW, &raw)?;
-	let keys = relay_terminal(keyboard, stdout.as_fd(), master.as_fd(), markers);
+	let keys = relay_terminal(keyboard, stdout.as_fd(), master.as_fd(), signals.as_fd(), markers);
 	// TCSADRAIN keeps the keys typed after we stopped sending them
-	termios::tcsetattr(keyboard, SetArg::TCSADRAIN, &cooked)?;
-	// If relaying failed, ssh may be stuck writing to its terminal until it closes
+	let restored = termios::tcsetattr(keyboard, SetArg::TCSADRAIN, &cooked);
+	// If relaying failed or we're ending, ssh may be stuck writing to its
+	// terminal, and won't end before it closes
 	drop(master);
 	let status = shell_status(ssh.wait()?);
+	if let Some(sig) = ending_signal() {
+		return Ok(128 + sig as i32);
+	}
+	restored?;
 	let keys = keys?.unwrap_or_default();
 	// zle -U would stop at a NUL
 	let keys: Vec<u8> = without_cancelled(&keys, &cooked).iter().copied().filter(|&k| k != 0).collect();
@@ -538,6 +620,18 @@ mod tests {
 		let partial_return = [&markers.return_start[..], b"68"].concat();
 		let (output, messages, held) = scan(&partial_return, &markers);
 		assert_eq!((output, messages.len(), held), (Vec::new(), 0, partial_return));
+	}
+
+	#[test]
+	fn scan_holds_the_longest_return_split_before_its_end() {
+		let markers = Markers::new(b"n1");
+		let hex = vec![b'a'; 2 * MAX_KEYS];
+		let partial = [&markers.return_start[..], &hex, &STRING_TERMINATOR[..1]].concat();
+		let (output, messages, held) = scan(&partial, &markers);
+		assert_eq!((output.len(), messages.len(), held.len()), (0, 0, partial.len()));
+		let broken = [&markers.return_start[..], &hex, b"xy"].concat();
+		let (output, _, held) = scan(&broken, &markers);
+		assert_eq!((output.len(), held.len()), (broken.len(), 0));
 	}
 
 	#[test]
