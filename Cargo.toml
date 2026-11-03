@@ -2,6 +2,7 @@
 name = "ssh-typeahead"
 version = "0.1.0"
 edition = "2024"
+license = "CC0-1.0"
 
 [dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["term", "process", "signal", "poll", "fs", "ioctl", "user"] }
