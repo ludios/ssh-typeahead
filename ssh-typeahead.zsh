@@ -6,6 +6,7 @@
 # Source this from an interactive shell's zshrc.
 
 () {
+	emulate -L zsh
 	local dir=${XDG_RUNTIME_DIR:-${TMPDIR:-}}
 	# A directory that we own, and that the group and others can't write to,
 	# as relay checks too: anyone who can write the file can type into this shell
