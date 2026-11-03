@@ -46,7 +46,7 @@ use nix::libc;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
-use nix::sys::termios::{self, InputFlags, LocalFlags, SetArg, SpecialCharacterIndices, Termios};
+use nix::sys::termios::{self, LocalFlags, SetArg, SpecialCharacterIndices, Termios};
 use nix::unistd;
 
 /// How long `run` waits for END, which only fails to come when something is broken
@@ -77,6 +77,13 @@ impl Markers {
 			return_start: apc("return", b";"),
 		}
 	}
+}
+
+/// Returns whether `nonce` is fit to mark messages: 1 to 64 letters, digits,
+/// dots, dashes and underscores, none of which ESC, `;`, a newline, or ssh's
+/// escape character can be.
+fn is_valid_nonce(nonce: &[u8]) -> bool {
+	(1..=64).contains(&nonce.len()) && nonce.iter().all(|&c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
 }
 
 /// Returns where `needle` first starts in `haystack`, if anywhere.
@@ -158,10 +165,13 @@ fn run_command(argv: &[OsString]) -> io::Result<i32> {
 	Ok(shell_status(child.wait()?))
 }
 
-/// Prints STOP, then reads keys until END, or for at most END_TIMEOUT.
+/// tty:     the far terminal, in raw mode
+/// markers: this NONCE's messages
 ///
-/// Returns the keys that came before END.
-fn read_until_end(tty: BorrowedFd, markers: &Markers) -> io::Result<Vec<u8>> {
+/// Prints STOP, then reads keys until END, for at most END_TIMEOUT. Returns
+/// the keys that came before END, or None if END didn't come, or came after
+/// too many keys: then there's no `relay` to take them.
+fn read_until_end(tty: BorrowedFd, markers: &Markers) -> io::Result<Option<Vec<u8>>> {
 	write_all(tty, &markers.stop)?;
 	let deadline = Instant::now() + END_TIMEOUT;
 	let mut received = Vec::new();
@@ -169,27 +179,26 @@ fn read_until_end(tty: BorrowedFd, markers: &Markers) -> io::Result<Vec<u8>> {
 	loop {
 		if let Some(end_at) = find(&received, &markers.end) {
 			received.truncate(end_at);
-			break;
+			return Ok((received.len() <= MAX_KEYS).then_some(received));
 		}
-		if received.len() >= MAX_KEYS + markers.end.len() {
-			break;
+		if received.len() > MAX_KEYS + markers.end.len() {
+			return Ok(None);
 		}
 		let left = deadline.saturating_duration_since(Instant::now());
 		let mut fds = [PollFd::new(tty, PollFlags::POLLIN)];
 		match poll(&mut fds, PollTimeout::try_from(left).unwrap_or(PollTimeout::MAX)) {
-			Ok(0) => break,
-			Ok(_) | Err(Errno::EINTR) => {}
+			Ok(0) => return Ok(None),
+			Ok(_) => {}
+			Err(Errno::EINTR) => continue,
 			Err(e) => return Err(e.into()),
 		}
 		match unistd::read(tty, &mut buf) {
-			Ok(0) => break,
+			Ok(0) => return Ok(None),
 			Ok(n) => received.extend_from_slice(&buf[..n]),
 			Err(Errno::EINTR) => {}
 			Err(e) => return Err(e.into()),
 		}
 	}
-	received.truncate(MAX_KEYS);
-	Ok(received)
 }
 
 /// tty:     the far terminal, which the command has finished with
@@ -198,13 +207,11 @@ fn read_until_end(tty: BorrowedFd, markers: &Markers) -> io::Result<Vec<u8>> {
 /// Does steps 1 and 2 of the handshake. Returns the keys that were typed but
 /// not read: the ones that the terminal still queued, as its line editing left
 /// them (e.g. with a backspace applied), then the ones on their way, as typed.
-fn unread_keys(tty: BorrowedFd, markers: &Markers) -> io::Result<Vec<u8>> {
+/// Returns None if `relay` didn't answer.
+fn unread_keys(tty: BorrowedFd, markers: &Markers) -> io::Result<Option<Vec<u8>>> {
 	let saved = termios::tcgetattr(tty)?;
 	let mut raw = saved.clone();
-	raw.input_flags.remove(InputFlags::ICRNL | InputFlags::INLCR | InputFlags::IGNCR | InputFlags::ISTRIP | InputFlags::IXON);
-	raw.local_flags.remove(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ECHONL | LocalFlags::ISIG | LocalFlags::IEXTEN);
-	raw.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
-	raw.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
+	termios::cfmakeraw(&mut raw);
 	// TCSANOW, unlike TCSAFLUSH, keeps the queued keys that we're after
 	termios::tcsetattr(tty, SetArg::TCSANOW, &raw)?;
 	let keys = read_until_end(tty, markers);
@@ -212,8 +219,10 @@ fn unread_keys(tty: BorrowedFd, markers: &Markers) -> io::Result<Vec<u8>> {
 	keys
 }
 
-/// The far side: runs `argv`, then does the whole handshake if this is a terminal.
+/// markers: this NONCE's messages
+/// argv:    the command to run
 ///
+/// The far side: runs `argv`, then does the whole handshake if this is a terminal.
 /// Returns the command's exit status, for `run` to exit with.
 fn run(markers: &Markers, argv: &[OsString]) -> io::Result<i32> {
 	let status = run_command(argv)?;
@@ -221,7 +230,7 @@ fn run(markers: &Markers, argv: &[OsString]) -> io::Result<i32> {
 	let tty = stdin.as_fd();
 	// If the terminal has gone, so has anyone who would want the keys
 	if stdin.is_terminal()
-		&& let Ok(keys) = unread_keys(tty, markers)
+		&& let Ok(Some(keys)) = unread_keys(tty, markers)
 	{
 		let _ = write_all(tty, &[&markers.return_start[..], &to_hex(&keys), STRING_TERMINATOR].concat());
 	}
@@ -521,9 +530,12 @@ fn is_safe_keys_file(path: &Path, tty: BorrowedFd) -> bool {
 		&& dir.mode() & 0o022 == 0
 }
 
-/// The near side: runs `argv` (ssh) and relays this terminal to it. Afterwards,
-/// appends any keys that came back to `keys_file`.
+/// markers:   this NONCE's messages
+/// keys_file: FILE, the $SSH_TYPEAHEAD_FILE from ssh-typeahead.zsh
+/// argv:      the command to run: ssh, with `run` as its far command
 ///
+/// The near side: runs `argv` and relays this terminal to it. Afterwards,
+/// appends any keys that came back to `keys_file`.
 /// Returns ssh's exit status, for `relay` to exit with.
 fn relay(markers: &Markers, keys_file: &Path, argv: &[OsString]) -> io::Result<i32> {
 	let stdin = io::stdin();
@@ -574,12 +586,14 @@ fn relay(markers: &Markers, keys_file: &Path, argv: &[OsString]) -> io::Result<i
 
 fn main() {
 	let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-	let result = match args.first().and_then(|a| a.to_str()) {
-		Some("relay") if args.len() >= 4 => relay(&Markers::new(args[1].as_bytes()), Path::new(&args[2]), &args[3..]),
-		Some("run") if args.len() >= 3 => run(&Markers::new(args[1].as_bytes()), &args[2..]),
+	let nonce = args.get(1).map(|n| n.as_bytes()).filter(|n| is_valid_nonce(n));
+	let result = match (args.first().and_then(|a| a.to_str()), nonce) {
+		(Some("relay"), Some(nonce)) if args.len() >= 4 => relay(&Markers::new(nonce), Path::new(&args[2]), &args[3..]),
+		(Some("run"), Some(nonce)) if args.len() >= 3 => run(&Markers::new(nonce), &args[2..]),
 		_ => {
 			eprintln!("usage: ssh-typeahead relay NONCE FILE COMMAND [ARG]...");
 			eprintln!("       ssh-typeahead run NONCE COMMAND [ARG]...");
+			eprintln!("NONCE: 1 to 64 letters, digits, dots, dashes and underscores, new for each command");
 			std::process::exit(2);
 		}
 	};
@@ -596,6 +610,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn nonces_cant_contain_marker_syntax() {
+		assert!(is_valid_nonce(b"123.1793535.25-x_Y"));
+		for bad in [&b""[..], b"a;b", b"a\x1bb", b"a b", b"a~", &[b'a'; 65]] {
+			assert!(!is_valid_nonce(bad), "{bad:?}");
+		}
+	}
 
 	#[test]
 	fn hex_round_trips() {
